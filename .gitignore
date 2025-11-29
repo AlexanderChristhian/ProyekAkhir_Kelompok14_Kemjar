@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+src/node_modules/
+
+# Environment variables
+.env
+
+# Uploaded files (Keep the folder, ignore content)
+src/public/uploads/*
+!src/public/uploads/.gitkeep
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Testing artifacts
+src/test_upload.txt
+Testing File/
