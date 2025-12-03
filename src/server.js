@@ -41,22 +41,36 @@ if (!fs.existsSync(uploadDir)){
 }
 
 // ==========================================
-// VULNERABILITY 1: INSECURE FILE UPLOAD
+// SECURE FILE UPLOAD IMPLEMENTATION
 // ==========================================
 const storage = multer.diskStorage({
     destination: uploadDir,
     filename: function (req, file, cb) {
-        // [VULNERABLE 1.1] Unrestricted File Extension
-        // Kita menyimpan file dengan nama aslinya.
-        // Jika user upload 'shell.html', tersimpan sebagai 'shell.html'.
-        cb(null, file.originalname); 
+        // [SECURE] Rename file to prevent overwriting and sanitize filename
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        cb(null, uniqueSuffix + path.extname(file.originalname));
     }
 });
 
-// [VULNERABLE 1.2] No File Size Limit
-// Kita tidak menambahkan opsi 'limits: { fileSize: ... }'
-// Kita juga tidak menambahkan 'fileFilter' untuk cek tipe file.
-const upload = multer({ storage: storage }); 
+// [SECURE] Add File Size Limit and File Filter
+const upload = multer({ 
+    storage: storage,
+    limits: { fileSize: 50 * 1024 * 1024 }, // Limit: 50MB (Increased for video)
+    fileFilter: (req, file, cb) => {
+        // Allowed extensions
+        const filetypes = /jpeg|jpg|png|pdf|docx|mp4/;
+        // Check extension
+        const extname = filetypes.test(path.extname(file.originalname).toLowerCase());
+        // Check mime type
+        const mimetype = filetypes.test(file.mimetype);
+
+        if (mimetype && extname) {
+            return cb(null, true);
+        } else {
+            cb(new Error('Error: File upload only supports images, PDF, DOCX, and MP4!'));
+        }
+    }
+}); 
 
 // ==========================================
 // ROUTES
@@ -120,45 +134,104 @@ app.get('/debug/users', (req, res) => {
 // ENDPOINT BERMASALAH (TARGET SERANGAN)
 // ==========================================
 
-// 1. Proses Upload (Vulnerable)
-app.post('/upload', upload.single('file'), (req, res) => {
-    if(!req.file) {
-        return res.send("Pilih file dulu!");
+// 1. Proses Upload (Secure)
+app.post('/upload', (req, res) => {
+    // [SECURE] Ensure user is logged in
+    if (!req.session.user) {
+        return res.redirect('/');
     }
-    // File berhasil diupload tanpa pengecekan
-    // Re-render dashboard with success message
-    fs.readdir(uploadDir, (err, files) => {
-        res.render('dashboard', {
-            user: req.session.user,
-            files: files || [],
-            message: `File berhasil diupload! Tersimpan di /uploads/${req.file.originalname}`
+
+    // [SECURE] Check Content-Length header before processing upload
+    // This prevents the server from even accepting the stream if the declared size is too big
+    const contentLength = parseInt(req.headers['content-length']);
+    if (contentLength > 50 * 1024 * 1024) {
+         return fs.readdir(uploadDir, (readErr, files) => {
+            res.render('dashboard', {
+                user: req.session.user,
+                files: files || [],
+                message: '<span class="text-danger">Error: File terlalu besar! Maksimal 50MB.</span>'
+            });
         });
-    });
-});
+    }
 
-// 2. Proses Ganti Password (Vulnerable)
-app.post('/change-password', (req, res) => {
-    // [VULNERABLE 2.1] IDOR (Insecure Direct Object Reference)
-    // Kita mengambil ID user dari 'req.body.user_id' (Input Hidden di Form)
-    // BUKAN dari 'req.session.user.id' (Session Server).
-    // Ini memungkinkan hacker mengubah ID orang lain.
-    const targetUserId = req.body.user_id; 
-    
-    const newPassword = req.body.new_password;
-
-    // [VULNERABLE 2.2] Missing Current Password Check
-    // Kita langsung menjalankan perintah UPDATE tanpa validasi password lama.
-    
-    db.run("UPDATE users SET password = ? WHERE id = ?", [newPassword, targetUserId], function(err) {
+    upload.single('file')(req, res, (err) => {
         if (err) {
-            return console.error(err.message);
+            // [SECURE] Manual cleanup if file exists (Multer sometimes leaves partial files on error)
+            if (req.file && req.file.path) {
+                fs.unlink(req.file.path, (e) => { if(e) console.error("Cleanup error:", e); });
+            }
+
+            let errorMessage = err.message;
+            if (err.code === 'LIMIT_FILE_SIZE') {
+                errorMessage = 'Error: File terlalu besar! Maksimal 50MB.';
+            }
+            
+            // Handle Multer Errors (File too large, wrong type)
+            return fs.readdir(uploadDir, (readErr, files) => {
+                res.render('dashboard', {
+                    user: req.session.user,
+                    files: files || [],
+                    message: `<span class="text-danger">${errorMessage}</span>`
+                });
+            });
         }
-        
+
+        if (!req.file) {
+            return res.send("Pilih file dulu!");
+        }
+
+        // File berhasil diupload dengan aman
         fs.readdir(uploadDir, (err, files) => {
             res.render('dashboard', {
                 user: req.session.user,
                 files: files || [],
-                message: `Password Berhasil Diganti untuk User ID: ${targetUserId}`
+                message: `File berhasil diupload! Tersimpan sebagai ${req.file.filename}`
+            });
+        });
+    });
+});
+
+// 2. Proses Ganti Password (Secure)
+app.post('/change-password', (req, res) => {
+    // [SECURE] Get User ID from Session (Prevent IDOR)
+    if (!req.session.user) {
+        return res.redirect('/');
+    }
+    const userId = req.session.user.id;
+    
+    const { current_password, new_password } = req.body;
+
+    // [SECURE] Verify Current Password First
+    db.get("SELECT * FROM users WHERE id = ?", [userId], (err, user) => {
+        if (err || !user) {
+            return res.status(500).send("Database Error");
+        }
+
+        if (user.password !== current_password) {
+             return fs.readdir(uploadDir, (err, files) => {
+                res.render('dashboard', {
+                    user: req.session.user,
+                    files: files || [],
+                    message: '<span class="text-danger">Gagal! Password lama salah.</span>'
+                });
+            });
+        }
+
+        // Update password
+        db.run("UPDATE users SET password = ? WHERE id = ?", [new_password, userId], function(err) {
+            if (err) {
+                return console.error(err.message);
+            }
+            
+            // Update session data
+            req.session.user.password = new_password;
+
+            fs.readdir(uploadDir, (err, files) => {
+                res.render('dashboard', {
+                    user: req.session.user,
+                    files: files || [],
+                    message: 'Password Berhasil Diganti!'
+                });
             });
         });
     });
